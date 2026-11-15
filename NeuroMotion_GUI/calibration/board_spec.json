@@ -1,0 +1,23 @@
+{
+  "model": "DFOPTIX Q12-50-3",
+  "source_image": null,
+  "board_size_mm": [
+    50,
+    50
+  ],
+  "pattern_size_mm": [
+    36,
+    27
+  ],
+  "square_size_mm": 3.0,
+  "square_count": [
+    12,
+    9
+  ],
+  "inner_corner_count": [
+    11,
+    8
+  ],
+  "source_kind": "user_provided_product_specification_image",
+  "is_camera_calibration": false
+}

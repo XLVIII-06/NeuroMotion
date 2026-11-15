@@ -1,0 +1,55 @@
+.venv/
+__pycache__/
+*.py[cod]
+output/
+sessions/
+.pytest_cache/
+.ruff_cache/
+startup_error.log
+*.log
+
+# Local plans, validation reports, hardware reference manuals and experiment state.
+Docs/*PLAN*.md
+Docs/*REPORT*.md
+Docs/EXECUTION_STATUS.json
+Docs/DIRECTORY_STRUCTURE.md
+Docs/Electronic hardware/
+
+# Windows builds are delivered locally, not committed as large Git blobs.
+NeuroMotion_GUI/build/
+NeuroMotion_GUI/dist/
+NeuroMotion_GUI/*.exe
+NeuroMotion_GUI/*.exe.new
+
+# Personal sample paths and actual camera calibration stay on this computer.
+NeuroMotion_GUI/config.sync-example.json
+NeuroMotion_GUI/calibration/*
+!NeuroMotion_GUI/calibration/board_spec.json
+
+# Generated isolated diagnostic projects and machine-specific baseline paths.
+NeuroMotion_MCU/mcu_diagnosis/project/
+NeuroMotion_MCU/mcu_diagnosis/active_run.json
+NeuroMotion_MCU/mcu_diagnosis/*_manifest.json
+NeuroMotion_MCU/mcu_diagnosis/README.md
+NeuroMotion_MCU/**/MDK-ARM/build/
+NeuroMotion_MCU/**/MDK-ARM/ads1292_f446re/
+*.uvguix.*
+*.uvoptx
+*.axf
+*.hex
+*.map
+*.o
+*.d
+*.crf
+*.dep
+*.lnp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Credentials and local environment overrides.
+.env
+.env.*
+!.env.example
+*.pem
+*.key

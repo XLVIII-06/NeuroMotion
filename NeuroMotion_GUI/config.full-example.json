@@ -1,0 +1,21 @@
+{
+  "emg_csv": "path/to/new_recording.csv",
+  "video_path": "path/to/new_video.mp4",
+  "output_dir": "output/full_run_01",
+  "led_roi": {"x": 0, "y": 0, "w": 80, "h": 80},
+  "marker_roi": {"x": 100, "y": 100, "w": 800, "h": 600},
+  "intrinsics_path": "path/to/intrinsics.json",
+  "homography_path": "path/to/homography.json",
+  "marker_count": 5,
+  "nominal_rate_hz": 1000,
+  "led_metric": "p99",
+  "marker_threshold": 200,
+  "marker_search_range_px": 50,
+  "marker_memory_frames": 5,
+  "max_motion_gap_s": 0.1,
+  "max_emg_gap_samples": 1,
+  "allow_constant_fps_fallback": false,
+  "max_intrinsics_rms_px": 2.0,
+  "max_homography_rms_mm": 1.0,
+  "sync_only": false
+}

@@ -1,0 +1,11 @@
+{
+  "emg_csv": "path/to/recording.csv",
+  "video_path": "path/to/video.mp4",
+  "output_dir": "output/sync_run",
+  "led_roi": {"x": 0, "y": 0, "w": 80, "h": 80},
+  "led_metric": "p99",
+  "led_threshold_strategy": "otsu_high_margin",
+  "nominal_rate_hz": 1000,
+  "marker_count": 5,
+  "sync_only": true
+}
