@@ -88,16 +88,24 @@ def plot_window(values: np.ndarray, limits=None, max_points: int = 2000) -> np.n
         last = min(len(values), int(np.searchsorted(times, high, side="right")) + 1)
         values = values[first:last]
     if len(values) > max_points:
-        bins = max(1, max_points // 10)
+        columns = [2, 3, 4, 5] + list(range(8, values.shape[1]))
+        bins = max(1, max_points // (2 * len(columns) + 2))
         size = max(1, math.ceil(len(values) / bins))
         selected = {0, len(values) - 1}
-        edges = np.flatnonzero(np.diff(values[:, 6])) + 1
+        ttl = values[:, 6]
+        finite = np.isfinite(ttl)
+        edges = np.flatnonzero((finite[1:] != finite[:-1]) | (finite[1:] & finite[:-1] & (ttl[1:] != ttl[:-1]))) + 1
+        gaps = np.flatnonzero(np.any(np.diff(np.isfinite(values[:, columns]), axis=0), axis=1)) + 1
+        edges = np.union1d(edges, gaps)
         selected.update(edges.tolist())
         selected.update((edges - 1).tolist())
         for start in range(0, len(values), size):
-            block = values[start:start + size, 2:6]
-            selected.update((start + np.argmin(block, axis=0)).tolist())
-            selected.update((start + np.argmax(block, axis=0)).tolist())
+            block = values[start:start + size, columns]
+            valid_columns = np.isfinite(block).any(axis=0)
+            if valid_columns.any():
+                block = block[:, valid_columns]
+                selected.update((start + np.argmin(np.where(np.isfinite(block), block, np.inf), axis=0)).tolist())
+                selected.update((start + np.argmax(np.where(np.isfinite(block), block, -np.inf), axis=0)).tolist())
         values = values[sorted(selected)]
     return values
 
@@ -145,7 +153,7 @@ class LiveAxes:
         visible = data[(data[:, 1] >= self.x_limits[0]) & (data[:, 1] <= self.x_limits[1])] if len(data) else data
         if self.linked:
             limits = auto_limits(visible[:, list(columns)]) if self.common_y.automatic else (self.common_y.minimum_uv, self.common_y.maximum_uv)
-            return [limits, limits]
+            return [limits] * len(columns)
         return [auto_limits(visible[:, column]) if settings.automatic else (settings.minimum_uv, settings.maximum_uv)
                 for column, settings in zip(columns, self.channels)]
 

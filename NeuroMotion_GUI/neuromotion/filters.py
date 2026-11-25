@@ -32,8 +32,11 @@ class FilterSettings:
 
 
 class RealtimeFilters:
-    def __init__(self, settings: FilterSettings):
+    def __init__(self, settings: FilterSettings, channels: int = 2):
         settings.validate()
+        if channels < 1 or channels > 4:
+            raise ValueError("Filter channel count must be 1–4")
+        self.channels = channels
         self.settings = settings
         stages = []
         for cutoff, high in ((settings.high_pass_hz, True), (settings.low_pass_hz, False)):
@@ -51,13 +54,15 @@ class RealtimeFilters:
             notch = [1 / (1 + alpha), -2 * cosine / (1 + alpha), 1 / (1 + alpha), 1, -2 * cosine / (1 + alpha), (1 - alpha) / (1 + alpha)]
             stages.insert(2 if settings.high_pass_hz else 0, notch)
         self.sos = np.asarray(stages, dtype=float).reshape(-1, 6)
-        self.zi = np.zeros((len(stages), 2, 2), dtype=float)
-        self.history = np.empty((1000, 2), dtype=float)
+        self.zi = np.zeros((len(stages), 2, channels), dtype=float)
+        self.history = np.empty((1000, channels), dtype=float)
         self.history_count = 0
         self.history_position = 0
 
     def process(self, raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         values = np.asarray(raw, dtype=float).copy()
+        if values.ndim != 2 or values.shape[1] != self.channels or not np.isfinite(values).all():
+            raise ValueError("Filter input must have the configured channels and finite values")
         changed = np.zeros(len(values), dtype=bool)
         if self.settings.despike:
             for index, pair in enumerate(values):

@@ -19,6 +19,9 @@ from .video import TRACK_DTYPE, QUALITY_NAMES
 
 EMG_DTYPE = np.dtype([("sample_index", "i8"), ("common_time_s", "f8"), ("primary1", "f8"), ("primary2", "f8"),
                       ("raw1", "f8"), ("raw2", "f8"), ("filtered1", "f8"), ("filtered2", "f8"), ("sync", "i1"), ("revision", "i8")])
+EMG4_DTYPE = np.dtype(EMG_DTYPE.descr + [("primary3","f8"),("primary4","f8"),("raw3","f8"),("raw4","f8"),
+                                      ("filtered3","f8"),("filtered4","f8")]
+                     + [(f"quality{i}","u1") for i in range(1,5)] + [(f"filter_quality{i}","u1") for i in range(1,5)])
 FRAME_DTYPE = np.dtype([("frame_index", "i8"), ("video_time_s", "f8"), ("common_time_s", "f8"), ("led_state", "i1")])
 
 
@@ -44,6 +47,9 @@ def _flush_array(buffer: RecordBuffer, output: Path):
 
 def build_replay_index(result_dir: str | Path, progress=lambda _: None, cancel_event=None) -> dict:
     root = Path(result_dir).resolve()
+    if (root/'result_manifest.json').is_file():
+        from .result_store import build_derived_index
+        return build_derived_index(root, progress, cancel_event)
     report = json.loads((root / "alignment_report.json").read_text(encoding="utf-8"))
     if report["status"] not in ("sync_validated", "full_fusion_generated"):
         raise ValueError("Replay needs a successful alignment result")
@@ -51,13 +57,13 @@ def build_replay_index(result_dir: str | Path, progress=lambda _: None, cancel_e
     manifest_path = index / "manifest.json"
     if manifest_path.is_file():
         cached = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if cached.get("schema_version") == 3 and cached["fingerprint"] == _fingerprint(report) and all(_stamp(Path(item["path"])) == item for item in cached["sources"]):
+        if cached.get("schema_version") == 4 and cached["fingerprint"] == _fingerprint(report) and all(_stamp(Path(item["path"])) == item for item in cached["sources"]):
             return cached
     index.mkdir(exist_ok=True)
     data_dir = index / ("data_" + uuid4().hex)
     data_dir.mkdir()
     sources = []
-    for key in ("emg_csv", "video"):
+    for key in ("emg_csv", "video", *(["sync_edges"] if "sync_edges" in report["input_files"] else [])):
         path = Path(report["input_files"][key]["path"])
         progress(f"校验回放来源：{path.name}")
         if file_info(path)["sha256"] != report["input_files"][key]["sha256"]:
@@ -72,7 +78,8 @@ def build_replay_index(result_dir: str | Path, progress=lambda _: None, cancel_e
     session = next(item for item in report["emg_sessions"] if item["session_number"] == report["alignment"]["session_number"])
     a = report["alignment"]["slope_samples_per_second"]
     fitted_start = report["alignment"]["fitted_start_sample"]
-    buffer = RecordBuffer(EMG_DTYPE, data_dir / "emg.bin")
+    channel_count = session.get("metadata",{}).get("channel_count",2)
+    buffer = RecordBuffer(EMG4_DTYPE if channel_count == 4 else EMG_DTYPE, data_dir / "emg.bin")
     offset = 0
     raw_available = False
     filtered_available = False
@@ -87,6 +94,21 @@ def build_replay_index(result_dir: str | Path, progress=lambda _: None, cancel_e
             if stop <= start:
                 continue
             block = block.iloc[start:stop]
+            if channel_count == 4:
+                from .signals_v2 import QUALITY_CODES
+                ids=block.sample_index.to_numpy(dtype=np.int64)
+                values=block[[f"ch{i}_aligned_uv" for i in range(1,5)]].to_numpy(dtype=float)
+                filtered=block[[f"ch{i}_filtered_uv" for i in range(1,5)]].to_numpy(dtype=float)
+                common=block.common_time_s.to_numpy(dtype=float)
+                quality=block[[f"quality_ch{i}" for i in range(1,5)]].apply(lambda a:a.map(QUALITY_CODES)).to_numpy(dtype=np.uint8)
+                fq=block[[f"filter_quality_ch{i}" for i in range(1,5)]].apply(lambda a:a.map(QUALITY_CODES)).to_numpy(dtype=np.uint8)
+                filtered_available=True
+                for j in range(len(block)):
+                    buffer.append((ids[j],common[j],values[j,0],values[j,1],np.nan,np.nan,filtered[j,0],filtered[j,1],
+                                   int(block.sync.iloc[j]),int(block.filter_revision.iloc[j]),values[j,2],values[j,3],np.nan,np.nan,
+                                   filtered[j,2],filtered[j,3],*quality[j],*fq[j]))
+                if offset >= session["source_row_end"]:break
+                continue
             index_key = "sample_index" if "sample_index" in block else "sampleIndex"
             raw_available = {"ch1_raw_uv", "ch2_raw_uv"}.issubset(block.columns)
             recorded = ("ch1_uv", "ch2_uv") if "ch1_uv" in block else ("ch1", "ch2")
@@ -152,7 +174,7 @@ def build_replay_index(result_dir: str | Path, progress=lambda _: None, cancel_e
         if row_count != marker_count * frames_count:
             raise ValueError("Tracking table does not contain one row per marker/frame")
         sources.append(_stamp(track_file))
-    manifest = {"schema_version": 3, "fingerprint": _fingerprint(report), "data_dir": data_dir.name,
+    manifest = {"schema_version": 4, "fingerprint": _fingerprint(report), "data_dir": data_dir.name, "channel_count":channel_count,
                 "sources": sources, "emg_count": emg_count, "frame_count": frames_count,
                 "marker_count": marker_count, "raw_available": raw_available, "filtered_available": filtered_available}
     write_json(manifest_path, manifest)
@@ -162,7 +184,11 @@ def build_replay_index(result_dir: str | Path, progress=lambda _: None, cancel_e
 class ReplayEngine:
     def __init__(self, result_dir: str | Path, progress=lambda _: None, cancel_event=None):
         self.root = Path(result_dir).resolve()
-        self.report = json.loads((self.root / "alignment_report.json").read_text(encoding="utf-8"))
+        if (self.root/'result_manifest.json').is_file():
+            from .result_store import replay_report
+            self.report = replay_report(self.root)
+        else:
+            self.report = json.loads((self.root / "alignment_report.json").read_text(encoding="utf-8"))
         self.manifest = build_replay_index(self.root, progress, cancel_event)
         data = self.root / "replay_index" / self.manifest["data_dir"]
         self.emg = np.load(data / "emg.npy", mmap_mode="r")
@@ -173,6 +199,9 @@ class ReplayEngine:
         times = self.frame_times
         first = max(float(times[0]), float(self.emg_times[0]))
         last = min(float(times[-1]), float(self.emg_times[-1]))
+        if self.manifest.get('common_coverage_s'):
+            first = max(first, self.manifest['common_coverage_s'][0])
+            last = min(last, self.manifest['common_coverage_s'][1])
         self.first_frame = int(np.searchsorted(times, first, side="left"))
         self.last_frame = int(np.searchsorted(times, last, side="right")) - 1
         if self.last_frame < self.first_frame:
@@ -185,8 +214,10 @@ class ReplayEngine:
             self.close()
             raise ValueError("Replay video could not be opened")
         self.undistorter = None
-        if self.tracking is not None:
+        if self.tracking is not None and self.report.get('calibration', {}).get('intrinsics'):
             self.undistorter = Undistorter(self.report["calibration"]["intrinsics"]["path"], (self.report["video"]["width"], self.report["video"]["height"]))
+        from .result_store import read_replay_events
+        self.events = read_replay_events(self.root)
         self.current_frame = -2
         self.cached_image = None
 
@@ -232,17 +263,25 @@ class ReplayEngine:
         window = self.emg[start:stop]
         # Keep extrema on all available analog branches while limiting rendering cost.
         if len(window) > 5000:
-            chunk = max(1, len(window) // 400)
+            fields=tuple(f"{branch}{i}" for branch in ("primary","filtered") for i in range(1,self.manifest.get("channel_count",2)+1))
+            bins=min(400,max(1,4800//(2*len(fields))))
+            chunk = max(1, len(window) // bins)
             selected = {0, len(window) - 1}
+            for field in fields:
+                edges=np.flatnonzero(np.diff(np.isfinite(window[field])))+1
+                selected.update(edges.tolist());selected.update((edges-1).tolist())
             for first in range(0, len(window), chunk):
-                for field in ("primary1", "primary2", "filtered1", "filtered2"):
+                for field in fields:
                     values = window[field][first:first + chunk]
                     if np.isfinite(values).any():
                         selected.update((first + int(np.nanargmin(values)), first + int(np.nanargmax(values))))
             window = window[sorted(selected)]
+        events = [e for e in self.events if e['common_time_s'] is not None and abs(e['common_time_s']-t) <= window_s/2]
         return {"frame_index": index, "video_time_s": float(frame["video_time_s"]), "common_time_s": t,
                 "emg_sample_float": self.report["alignment"]["slope_samples_per_second"] * float(frame["video_time_s"]) + self.report["alignment"]["intercept_samples"],
-                "led_state": int(frame["led_state"]), "positions": positions, "image": self.cached_image, "emg_window": window.copy()}
+                "led_state": int(frame["led_state"]), "positions": positions, "image": self.cached_image, "emg_window": window.copy(),
+                "channel_count": self.manifest.get("channel_count",2), "value_type": "software_aligned_resampled" if self.manifest.get("channel_count",2)==4 else "legacy",
+                'events': events}
 
     def close(self):
         if hasattr(self, "capture"):

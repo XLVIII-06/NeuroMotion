@@ -13,7 +13,8 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 
 from .acquisition import AcquisitionController, BinaryReplaySource, SimulatedSource
-from .axes import LiveAxes, plot_window, validate_window
+from .axes import LiveAxes, YAxisSettings, plot_window, validate_window
+from .simulated_v2 import SimulatedFourChannelSource
 from .axis_dialog import AxisSettingsDialog
 from .filters import FilterSettings
 from .plotting import TraceCanvas  # Also kept here for existing replay imports.
@@ -52,6 +53,7 @@ class LiveAcquisitionPage(ttk.Frame):
         self.window = tk.StringVar(value="10")
         self.pause = tk.BooleanVar(value=False)
         self.axes = LiveAxes()
+        self.channel_count = 2
         self.x_unit = tk.StringVar(value="s")
         self.view_status = tk.StringVar(value="实时跟随")
         self.frozen_data = None
@@ -61,7 +63,8 @@ class LiveAcquisitionPage(ttk.Frame):
         self.drag = None
         self.axis_dialog = None
         self._last_plot_stamp = None
-        self.summary = tk.StringVar(value="未连接 · 设备固定为两路、1000 Hz、921600 baud")
+        self.summary = tk.StringVar(value="未连接 · 自动识别双通道 v1 / 四通道 v2 · 1000 Hz、921600 baud")
+        self.clock_info = tk.StringVar()
         self.data_status = tk.StringVar(value="连接后等待 MCU 输出；实验开始时请手动复位 MCU。")
         self.file_status = tk.StringVar(value="记录后自动把本次 CSV 交给时间对齐页。实验开始前请先记录，再手动复位 MCU。")
         self.error_seen = ""
@@ -76,7 +79,7 @@ class LiveAcquisitionPage(ttk.Frame):
     def _build(self):
         source = ttk.LabelFrame(self, text="输入与实验记录", padding=10)
         source.pack(fill="x", pady=(0, 8))
-        ttk.Combobox(source, textvariable=self.kind, values=["真实串口", "模拟输入", "二进制回放"], state="readonly", width=13).grid(row=0, column=0, padx=4, pady=4)
+        ttk.Combobox(source, textvariable=self.kind, values=["真实串口", "四通道模拟", "模拟输入", "二进制回放"], state="readonly", width=13).grid(row=0, column=0, padx=4, pady=4)
         self.ports = ttk.Combobox(source, textvariable=self.port, width=13)
         self.ports.grid(row=0, column=1, padx=4)
         ttk.Button(source, text="刷新串口", command=self.refresh_ports).grid(row=0, column=2, padx=4)
@@ -102,6 +105,7 @@ class LiveAcquisitionPage(ttk.Frame):
         ttk.Checkbutton(settings, text="MAD 去尖峰", variable=self.despike).grid(row=0, column=5, padx=8)
         self.apply_button = ttk.Button(settings, text="应用滤波设置", command=self.apply_filters)
         self.apply_button.grid(row=0, column=6, padx=8)
+        ttk.Button(settings, text="EMG 20–200 Hz", command=self._emg_preset).grid(row=0, column=7, padx=4)
         controls = ttk.Frame(self)
         controls.pack(fill="x", pady=(0, 8))
         self.start_button = ttk.Button(controls, text="开始记录", command=self.start_recording, style="Accent.TButton")
@@ -111,6 +115,7 @@ class LiveAcquisitionPage(ttk.Frame):
         ttk.Checkbutton(controls, text="暂停画面", variable=self.pause, command=self._pause_changed).pack(side="left", padx=10)
         mode = ttk.Combobox(controls, textvariable=self.mode, values=["原始", "滤波"], state="readonly", width=6)
         mode.pack(side="left", padx=6)
+        self.mode_box = mode
         mode.bind("<<ComboboxSelected>>", lambda _: self.refresh_plot())
         view = ttk.Frame(self)
         view.pack(fill="x", pady=(0, 7))
@@ -127,12 +132,35 @@ class LiveAcquisitionPage(ttk.Frame):
         ttk.Label(view, textvariable=self.view_status, foreground="#2563eb").pack(side="left", padx=8)
         ttk.Label(self, text="图内滚轮缩放时间，拖拽平移；按住 Shift 调整纵轴；双击 EMG 恢复自动量程及实时跟随。", foreground="#64748b").pack(anchor="w", pady=(0, 5))
         ttk.Label(self, textvariable=self.summary, wraplength=1040, foreground="#2563eb").pack(anchor="w", pady=(0, 5))
+        ttk.Label(self, textvariable=self.clock_info, wraplength=1040, foreground="#475569").pack(anchor="w", pady=(0, 5))
         self.data_status_label = ttk.Label(self, textvariable=self.data_status, wraplength=1040, foreground="#64748b")
         self.data_status_label.pack(anchor="w", pady=(0, 5))
         ttk.Label(self, textvariable=self.file_status, wraplength=1040, foreground="#64748b").pack(anchor="w", pady=(0, 8))
         self.traces = []
-        for title, color, digital in (("CH1 · μV", "#2563eb", False), ("CH2 · μV", "#0f9e82", False), ("MCU TTL", "#d97706", True)):
-            canvas = TraceCanvas(self, title, color, digital)
+        self.trace_host = ttk.Frame(self)
+        self.trace_host.pack(fill="both", expand=True)
+        self._set_channels(2)
+
+    def _set_channels(self, count):
+        if len(self.traces) == count + 1:
+            return
+        for trace in self.traces:
+            trace.destroy()
+        self.traces = []
+        self.channel_count = count
+        self.axes.channels = (self.axes.channels + [YAxisSettings() for _ in range(count)])[:count]
+        self.last_y_ranges = (self.last_y_ranges + [(-1., 1.)] * count)[:count]
+        raw = self.mode.get() in ("原始", "未滤波（已对齐）")
+        modes = ["未滤波（已对齐）", "滤波（已对齐）"] if count == 4 else ["原始", "滤波"]
+        self.mode_box.configure(values=modes, width=20 if count == 4 else 6)
+        self.mode.set(modes[0] if raw else modes[1])
+        if self.axis_dialog is not None and self.axis_dialog.winfo_exists():
+            self.axis_dialog.destroy()
+            self.axis_dialog = None
+        colors = ("#2563eb", "#0f9e82", "#9333ea", "#dc4775")
+        specifications = [(f"CH{ch+1} · μV", colors[ch], False) for ch in range(count)] + [("MCU TTL", "#d97706", True)]
+        for title, color, digital in specifications:
+            canvas = TraceCanvas(self.trace_host, title, color, digital)
             canvas.pack(fill="both", expand=True, pady=3)
             self.traces.append(canvas)
             channel = len(self.traces) - 1
@@ -144,6 +172,13 @@ class LiveAcquisitionPage(ttk.Frame):
                 widget.bind("<Double-Button-1>", lambda event, ch=channel: self._double_click(event, ch))
         for canvas in self.traces:
             canvas.margin_group = self.traces
+        self._clear_history_view()
+
+    def _emg_preset(self):
+        self.high_pass.set("20")
+        self.low_pass.set("200")
+        if self.active:
+            self.apply_filters()
 
     def _sync_view_controls(self):
         scale = 1000 if self.axes.x_unit == "ms" else 1
@@ -160,6 +195,7 @@ class LiveAcquisitionPage(ttk.Frame):
         self._last_plot_stamp = None
 
     def _accept_epoch(self, state):
+        self._set_channels(state.get("channel_count", 2))
         if state["plot_epoch"] != self.plot_epoch:
             self.plot_epoch = state["plot_epoch"]
             self._clear_history_view()
@@ -202,7 +238,7 @@ class LiveAcquisitionPage(ttk.Frame):
         self.refresh_plot()
 
     def reset_axes(self):
-        self.axes = LiveAxes()
+        self.axes = LiveAxes(channels=[YAxisSettings() for _ in range(self.channel_count)])
         self.restore_live()
 
     def _window_changed(self, _event=None):
@@ -245,25 +281,27 @@ class LiveAcquisitionPage(ttk.Frame):
                 state = self.controller.snapshot(max_points=2000, plot_window_s=self.axes.window_s)
             data = state["plot"]
         else:
-            data = self.frozen_data if self.frozen_data is not None else np.empty((0, 8))
+            data = self.frozen_data if self.frozen_data is not None else np.empty((0, 12 if self.channel_count == 4 else 8))
         data = plot_window(data, self.axes.x_limits)
-        start = 2 if self.mode.get() == "原始" else 4
-        self.last_y_ranges = self.axes.y_ranges(data, (start, start + 1))
-        columns = (start, start + 1, 6)
-        margin = max(canvas.required_margin(data[:, col], self.last_y_ranges[ch] if ch < 2 else None,
-                                            self.axes.y_settings(ch).unit if ch < 2 else "auto")
+        raw = self.mode.get() in ("原始", "未滤波（已对齐）")
+        analog = (2, 3, 8, 9) if raw else (4, 5, 10, 11)
+        analog = analog[:self.channel_count]
+        self.last_y_ranges = self.axes.y_ranges(data, analog)
+        columns = (*analog, 6)
+        margin = max(canvas.required_margin(data[:, col], self.last_y_ranges[ch] if ch < self.channel_count else None,
+                                            self.axes.y_settings(ch).unit if ch < self.channel_count else "auto")
                      for ch, (canvas, col) in enumerate(zip(self.traces, columns)))
         for ch, (canvas, col) in enumerate(zip(self.traces, columns)):
             canvas.draw(data[:, 1], data[:, col], self.axes.window_s, x_limits=self.axes.x_limits,
-                        y_limits=self.last_y_ranges[ch] if ch < 2 else None, x_unit=self.axes.x_unit,
-                        unit=self.axes.y_settings(ch).unit if ch < 2 else "auto", left_margin=margin)
+                        y_limits=self.last_y_ranges[ch] if ch < self.channel_count else None, x_unit=self.axes.x_unit,
+                        unit=self.axes.y_settings(ch).unit if ch < self.channel_count else "auto", left_margin=margin)
         self._sync_view_controls()
 
     def _wheel(self, event, channel):
         factor = 1.2 ** float(np.clip(event.delta / 120, -10, 10))
         x_fraction, y_fraction = self.traces[channel].fractions(event)
         if event.state & 1:
-            if channel < 2:
+            if channel < self.channel_count:
                 self.axes.zoom_y(channel, self.last_y_ranges[channel], factor, y_fraction)
         else:
             if self._freeze():
@@ -276,10 +314,10 @@ class LiveAcquisitionPage(ttk.Frame):
 
     def _drag_start(self, event, channel):
         vertical = bool(event.state & 1)
-        if vertical and channel == 2:
+        if vertical and channel == self.channel_count:
             return "break"
         self.drag = DragGesture(channel, vertical, event.x_root, event.y_root, self.axes.x_limits,
-                                self.last_y_ranges[channel] if channel < 2 else None)
+                                self.last_y_ranges[channel] if channel < self.channel_count else None)
         return "break"
 
     def _drag_move(self, event):
@@ -310,7 +348,7 @@ class LiveAcquisitionPage(ttk.Frame):
         return "break"
 
     def _double_click(self, _event, channel):
-        if channel < 2:
+        if channel < self.channel_count:
             self.axes.reset_y(channel)
             self.restore_live()
         self.drag = None
@@ -367,7 +405,7 @@ class LiveAcquisitionPage(ttk.Frame):
             return
 
         def operation():
-            source = SimulatedSource(1800, speed) if kind == "模拟输入" else BinaryReplaySource(path, speed) if kind == "二进制回放" else None
+            source = SimulatedFourChannelSource(1800, speed) if kind == "四通道模拟" else SimulatedSource(1800, speed) if kind == "模拟输入" else BinaryReplaySource(path, speed) if kind == "二进制回放" else None
             self.controller.connect(port=port, source=source)
             return "连接成功；模拟/二进制回放在点击开始记录后推进。" if source else "串口已连接，预览中。"
 
@@ -392,7 +430,7 @@ class LiveAcquisitionPage(ttk.Frame):
             text, color = "设备未采集中；图表可浏览本次缓存。", "#64748b"
         elif state["samples"] == 0:
             text = "尚未收到有效样本。连接后请手动复位 MCU；固件启动约需 5 秒。"
-            if state["source"].get("kind") in ("simulated", "binary_replay") and not state["raw_bytes"]:
+            if state["source"].get("kind") in ("simulated", "simulated_four_channel", "binary_replay") and not state["raw_bytes"]:
                 text = "模拟/二进制回放输入在点击“开始记录”后推进；当前尚无样本。"
             elif state["raw_bytes"]:
                 text = "已收到串口字节，但尚无有效样本；请核对固件协议、串口参数和解析计数。"
@@ -406,6 +444,39 @@ class LiveAcquisitionPage(ttk.Frame):
         else:
             text = "正在接收新样本。" + ("画面为冻结历史，后台采集继续。" if not self.axes.follow else "")
             color = "#0f766e"
+        clock = state.get("clock")
+        if clock:
+            meta = clock.get("metadata") or {}
+            ppm = clock.get("relative_ppm")
+            devices = clock["devices"]
+            rates = [f"{d['fit']['rate_hz']:.3f} Hz" if d["fit"] else "测量中" for d in devices]
+            self.clock_info.set(f"四通道为软件对齐/重采样值 · 原生 A/B {clock['device_counts']} · DRDY {rates[0]} / {rates[1]} · "
+                                f"相对频差 {ppm:.2f} ppm · 状态 {devices[0]['state']} / {devices[1]['state']}" if ppm is not None else
+                                f"四通道时钟预热中 · 原生 A/B {clock['device_counts']} · 原生记录即时保存，四通道约延后 0.5 s。")
+            reference=clock.get("fixed_reference")
+            if reference:
+                self.clock_info.set(self.clock_info.get()+f" · 20 s参考：同序号Δt={reference['offset_us_at_reference']/1000:.3f} ms（n={reference['native_reference_index']:.0f}），Δf={reference['relative_ppm']:.2f} ppm")
+            self.clock_info.set(self.clock_info.get()+f" · 处理缓存 {clock.get('buffer_lag_s',0):.3f} s")
+            hardware = clock.get("hardware") or {}
+            if hardware:
+                counters = []
+                for field, label in (("capture_overrun", "捕获溢出"), ("dropped", "无效/缺样"),
+                                     ("spi_errors", "SPI 错误"), ("status_errors", "ADC 状态错误"), ("late", "迟读")):
+                    counters.append(f"{label} A/B {hardware.get(field+'_a',0)}/{hardware.get(field+'_b',0)}")
+                self.clock_info.set(self.clock_info.get()+" · "+" · ".join(counters))
+                if any(hardware.get(field, 0) for field in ("capture_overrun_a", "capture_overrun_b", "dropped_a", "dropped_b",
+                       "spi_errors_a", "spi_errors_b", "status_errors_a", "status_errors_b", "late_a", "late_b",
+                       "edge_dropped", "record_dropped", "tx_errors")):
+                    text = "MCU 已报告采集或传输异常；请检查 A/B 错误计数及通道缺口，已有原生记录继续保留。"
+                    color = "#b45309"
+            if clock.get("ttl_start_us") is None and state["samples"]>4000:
+                text="EMG 已接收，TTL 起始锚点尚未捕获；请核对 PA8 原始数字输出到 PB10 的回接。"
+                color="#b45309"
+            if meta and meta.get("ready_mask") != 3:
+                text = f"ADS 初始化未完成：A ID={meta.get('id_a')} / error={meta.get('error_a')}，B ID={meta.get('id_b')} / error={meta.get('error_b')}。"
+                color = "#b45309"
+        else:
+            self.clock_info.set("")
         self.data_status.set(text)
         self.data_status_label.configure(foreground=color)
 
@@ -429,8 +500,10 @@ class LiveAcquisitionPage(ttk.Frame):
         for button, allowed in ((self.connect_button, not active), (self.disconnect_button, active),
                                 (self.start_button, active and not recording), (self.stop_button, recording), (self.apply_button, active)):
             button.state(["!disabled"] if allowed and not disabled else ["disabled"])
-        source_label = {"serial": "真实串口", "simulated": "模拟输入", "binary_replay": "二进制回放"}.get(state["source"].get("kind"), "未选择输入")
+        source_label = {"serial": "真实串口", "simulated": "模拟输入", "simulated_four_channel": "四通道模拟", "binary_replay": "二进制回放"}.get(state["source"].get("kind"), "未选择输入")
         self.summary.set(f"{source_label} · {state['state']} · 接收 {state['samples']} · 已保存 {state['recorded_samples']} · 序号缺口 {state['index_gaps']} · 帧错误 {state['frame_errors']} · 固件丢样 {state.get('firmware_dropped_latest', 0)} · 起始标志 {state['start_marker']}")
+        if state.get("channel_count")==4:
+            self.summary.set(f"{source_label} · {state['state']} · 原生接收 {state['samples']} · 原生已存 {state.get('native_recorded_samples',0)} · 四通道网格已存 {state['recorded_samples']} · 缺口 {state['index_gaps']} · 帧错误 {state['frame_errors']} · 起始标志 {state['start_marker']}")
         self._update_stream_status(state)
         if state["error"] and state["error"] != self.error_seen:
             self.error_seen = state["error"]

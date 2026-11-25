@@ -97,13 +97,13 @@ def analyze_video(config: VideoAnalysisConfig, progress=print) -> dict:
                 trace.close()
 
 
-def load_video_analysis(directory: Path, video_info: dict, require_markers: bool):
+def load_video_analysis(directory: Path, video_info: dict, require_markers: bool, *, require_metric: bool = True):
     report = json.loads((directory / "video_analysis_report.json").read_text(encoding="utf-8"))
     if report["status"] != "video_analysis_complete" or not report["led_extracted"]:
         raise ValueError("Selected video analysis has no completed LED extraction")
     if report["source_video"]["sha256"] != video_info["sha256"]:
         raise ValueError("Video analysis belongs to a different source video")
-    if require_markers and (not report["markers_extracted"] or not report.get("millimeter_coordinates")):
+    if require_markers and (not report["markers_extracted"] or (require_metric and not report.get("millimeter_coordinates"))):
         raise ValueError("Full fusion needs completed pixel/mm marker analysis")
     data = np.load(directory / "cache/video_trace.npy", mmap_mode="r")
     meta = report["video"]

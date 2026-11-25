@@ -74,7 +74,11 @@ void Error_Handler(void);
 #define TCK_GPIO_Port GPIOA
 #define SWO_Pin GPIO_PIN_3
 #define SWO_GPIO_Port GPIOB
+#if defined(NEUROMOTION_DUAL_ADC) && defined(NEUROMOTION_RIGHT_DRDY)
+#define ADS1292_START_Pin GPIO_PIN_4
+#else
 #define ADS1292_START_Pin GPIO_PIN_8
+#endif
 #define ADS1292_START_GPIO_Port GPIOB
 #define ADS_CS_Pin GPIO_PIN_9
 #define ADS_CS_GPIO_Port GPIOB

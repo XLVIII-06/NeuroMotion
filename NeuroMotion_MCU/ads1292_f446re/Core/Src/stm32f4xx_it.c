@@ -205,6 +205,7 @@ void SysTick_Handler(void)
   */
 void EXTI9_5_IRQHandler(void)
 {
+#ifndef NEUROMOTION_DUAL_ADC
   /* USER CODE BEGIN EXTI9_5_IRQn 0 */
 
   /* USER CODE END EXTI9_5_IRQn 0 */
@@ -213,6 +214,7 @@ void EXTI9_5_IRQHandler(void)
   ADS1292_DRDY_Callback(ADS1292_DRDY_Pin);
 
   /* USER CODE END EXTI9_5_IRQn 1 */
+#endif
 }
 
 /**
@@ -225,5 +227,11 @@ void EXTI15_10_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+#ifdef NEUROMOTION_DUAL_ADC
+#include "dual_adc.h"
+void TIM2_IRQHandler(void) { DualADC_TimerIRQ(); }
+void DMA1_Stream6_IRQHandler(void) { DualADC_DMAIRQ(); }
+void USART2_IRQHandler(void) { DualADC_UARTIRQ(); }
+#endif
 
 /* USER CODE END 1 */

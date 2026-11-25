@@ -24,13 +24,19 @@ class TraceCanvas(tk.Canvas):
         self.current_y = (-1.0, 1.0)
         self.current_x = (0.0, 10.0)
         self._resize_job = None
+        self._font_scale = None
         self.bind("<Configure>", self._schedule_redraw)
         self.bind("<Destroy>", self._destroyed, add="+")
 
     def _destroyed(self, event):
-        if event.widget is self and self._resize_job:
-            self.after_cancel(self._resize_job)
-            self._resize_job = None
+        if event.widget is self:
+            if self._resize_job:
+                self.after_cancel(self._resize_job)
+                self._resize_job = None
+            # Peer lists form cycles. Release the Tcl font now, on its GUI
+            # thread, instead of letting acquisition-triggered GC call Tk.
+            self.margin_group = []
+            self.axis_font = None
 
     def _schedule_redraw(self, _event=None):
         if self._resize_job:
@@ -43,6 +49,8 @@ class TraceCanvas(tk.Canvas):
         if self.margin_group:
             margins = []
             for peer in self.margin_group:
+                if peer.axis_font is None:
+                    continue
                 times, values = peer.last[:2]
                 visible = (times >= peer.current_x[0]) & (times <= peer.current_x[1])
                 margins.append(peer.required_margin(values[visible], peer.options.get("y_limits"), peer.options.get("unit", "auto")))
@@ -50,6 +58,13 @@ class TraceCanvas(tk.Canvas):
         self.draw(*self.last, **options)
 
     def axis_description(self, values, y_limits=None, unit="auto"):
+        scale = float(self.tk.call("tk", "scaling"))
+        if scale != self._font_scale:
+            # Tk can retain cached glyph widths after its scaling changes.
+            # Reconfigure before measuring any peer so the common margin is
+            # calculated from the same metrics that create_text will use.
+            self.axis_font.configure(size=self.axis_font.cget("size"))
+            self._font_scale = scale
         limits = (-0.15, 1.15) if self.digital else y_limits or auto_limits(values)
         limits = validate_limits(limits)
         name, divisor = ("", 1.0) if self.digital else value_unit(limits, unit)
@@ -68,10 +83,10 @@ class TraceCanvas(tk.Canvas):
         labels = self.axis_description(values, y_limits, unit)[4]
         return max([self.axis_font.measure(label) for label in labels] + [0]) + 16
 
-    def draw(self, times, values, window_s=10.0, cursor=None, *, x_limits=None, y_limits=None, x_unit="s", unit="auto", left_margin=None):
+    def draw(self, times, values, window_s=10.0, cursor=None, *, x_limits=None, y_limits=None, x_unit="s", unit="auto", left_margin=None, event_times=()):
         times, values = np.asarray(times), np.asarray(values)
         self.last = times, values, window_s, cursor
-        self.options = dict(x_limits=x_limits, y_limits=y_limits, x_unit=x_unit, unit=unit, left_margin=left_margin)
+        self.options = dict(x_limits=x_limits, y_limits=y_limits, x_unit=x_unit, unit=unit, left_margin=left_margin, event_times=event_times)
         self.delete("all")
         self.surface.delete("all")
         width = max(120, self.winfo_width())
@@ -146,6 +161,10 @@ class TraceCanvas(tk.Canvas):
         if cursor is not None and self.current_x[0] <= cursor <= self.current_x[1]:
             x = (cursor - self.current_x[0]) / (self.current_x[1] - self.current_x[0]) * (right - left)
             self.surface.create_line(x, 0, x, bottom - top, fill="#dc2626", dash=(3, 2), tags="cursor")
+        for t in event_times:
+            if np.isfinite(t) and self.current_x[0] <= t <= self.current_x[1]:
+                x = (t-self.current_x[0])/(self.current_x[1]-self.current_x[0])*(right-left)
+                self.surface.create_line(x, 0, x, bottom-top, fill='#9333ea', dash=(5, 3), tags='stimulus_event')
         if not np.any(visible):
             self.surface.create_text((right - left) / 2, (bottom - top) / 2, text="等待数据" if not len(times) else "此范围内暂无样本", font=self.axis_font, fill="#64748b")
 

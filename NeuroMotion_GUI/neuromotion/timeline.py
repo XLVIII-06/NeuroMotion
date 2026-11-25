@@ -49,14 +49,20 @@ class Alignment:
     unmatched_tail_video_edges: int = 0
     unmatched_tail_emg_edges: int = 0
     residual_limit_frames: float = 1.0
+    master_start_sample: float | None = None
+    master_rate_hz: float | None = None
 
     def sample_at_video_time(self, time_s: float | np.ndarray) -> float | np.ndarray:
         return self.slope_samples_per_second * time_s + self.intercept_samples
 
     def common_time_from_video(self, time_s: float | np.ndarray) -> float | np.ndarray:
+        if self.master_start_sample is not None:
+            return (self.sample_at_video_time(time_s) - self.master_start_sample) / self.master_rate_hz
         return time_s - self.video_start_s
 
     def common_time_from_sample(self, sample_index: float | np.ndarray) -> float | np.ndarray:
+        if self.master_start_sample is not None:
+            return (sample_index - self.master_start_sample) / self.master_rate_hz
         return (sample_index - self.fitted_start_sample) / self.slope_samples_per_second
 
     def as_dict(self) -> dict:

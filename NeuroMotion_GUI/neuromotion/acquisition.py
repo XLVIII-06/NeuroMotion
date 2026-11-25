@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from concurrent.futures import Future
 import csv
 from dataclasses import dataclass
@@ -20,6 +21,9 @@ from .filters import FilterSettings, RealtimeFilters
 from .session import create_session, write_json
 from .timeline import AlignmentError, find_start_marker
 from .axes import plot_window, validate_window
+from .protocol_v2 import MAGIC as V2_MAGIC, V2Decoder
+from .recording_v2 import FourChannelRecorder
+from .serial_transport import SerialSource
 
 
 FRAME_SIZE = 245
@@ -92,6 +96,9 @@ class BinaryReplaySource:
     def __init__(self, path: str | Path, speed: float = 1.0):
         self.path = Path(path).resolve()
         self.stream = self.path.open("rb")
+        prefix = self.stream.read(4096)
+        self.stream.seek(0)
+        self.bytes_per_second = 60000 if V2_MAGIC in prefix else (245 / 12 * 1000)
         self.speed = speed
         if speed < 0 or not math.isfinite(speed):
             self.stream.close()
@@ -119,7 +126,7 @@ class BinaryReplaySource:
         data = self.stream.read(size)
         self.eof = not data
         if self.speed:
-            self.deadline += len(data) / (245 / 12 * 1000 * self.speed)
+            self.deadline += len(data) / (self.bytes_per_second * self.speed)
         return data
 
     def close(self):
@@ -179,28 +186,6 @@ class SimulatedSource:
         self.eof = True
 
 
-class SerialSource:
-    kind = "serial"
-
-    def __init__(self, port: str, baudrate: int = 921600):
-        import serial
-        self.serial = serial.Serial(port, baudrate, timeout=0.05)
-        if hasattr(self.serial, "set_buffer_size"):
-            self.serial.set_buffer_size(rx_size=262144, tx_size=4096)
-        self.description = {"kind": self.kind, "port": port, "baudrate": baudrate, "format": "8N1"}
-        self.eof = False
-
-    @property
-    def in_waiting(self):
-        return self.serial.in_waiting
-
-    def read(self, size: int) -> bytes:
-        return self.serial.read(min(size, max(1, self.in_waiting)))
-
-    def close(self):
-        self.serial.close()
-
-
 class AcquisitionController:
     """One ordered worker owns parsing/filtering/writing; GUI only reads snapshots."""
 
@@ -214,10 +199,15 @@ class AcquisitionController:
         self.thread = None
         self.state = "disconnected"
         self.connection_id = 0
+        self.view_generation = 0
         self.connected_at = self.last_byte_at = self.last_sample_at = None
         self.error = ""
         self.source = None
         self.decoder = FrameDecoder()
+        self.protocol = None
+        self.probe = bytearray()
+        self.four = None
+        self.clock_snapshot = None
         self.record_dir = None
         self.last_record_dir = None
         self.writer_stream = self.binary = self.events_stream = None
@@ -249,6 +239,10 @@ class AcquisitionController:
             self.connected_at = time.monotonic()
             self.last_byte_at = self.last_sample_at = None
             self.decoder = FrameDecoder()
+            self.protocol = None
+            self.probe = bytearray()
+            self.four = None
+            self.clock_snapshot = None
             self.commands = queue.Queue(maxsize=32)
             self.history.clear()
             self.previous_index = None
@@ -319,24 +313,31 @@ class AcquisitionController:
             metadata = {"state": state, "error": error, "samples": self.received_samples, "recorded_samples": self.record_count,
                         "index_gaps": self.index_gaps, "duplicates": self.duplicates, "segment_id": self.segment,
                         "frame_errors": self.decoder.frame_errors, "invalid_records": self.decoder.invalid_records,
+                        "packet_gaps": getattr(self.decoder, "sequence_gaps", 0),
                         "valid_frames": self.decoder.valid_frames, "start_marker": self.start_marker,
                         "source": self.source.description if self.source else {}, "history_bounds_s": bounds,
                         "connection_elapsed_s": None if self.connected_at is None else now - self.connected_at,
                         "last_byte_age_s": None if self.last_byte_at is None else now - self.last_byte_at,
                         "last_sample_age_s": None if self.last_sample_at is None else now - self.last_sample_at,
-                        "plot_epoch": (self.connection_id, int(self.history[-1][7]) if self.history else self.segment), **stats}
-        values = np.asarray(rows, dtype=float).reshape(-1, 8)
+                        "plot_epoch": (self.connection_id, int(self.history[-1][7]) if self.history else self.segment) + ((self.view_generation,) if self.four else ()),
+                        "channel_count": 4 if self.four else 2, "protocol_version": 2 if self.four else 1,
+                        "clock": self.clock_snapshot,
+                        "transport": getattr(self.source, "diagnostics", {}), **stats}
+        values = np.asarray(rows, dtype=float).reshape(-1, 12 if metadata["channel_count"] == 4 else 8)
         metadata["plot"] = plot_window(values, max_points=max_points)
         return metadata
 
     def _open_recording(self, directory: Path):
-        if self.writer:
+        if self.record_dir:
             raise RuntimeError("A recording is already active")
+        if self.four and self.four.metadata and self.four.metadata.get("ready_mask") != 3:
+            raise ValueError("两块 ADS 尚未同时就绪，请检查 MCU 的模块 ID、PWDN 与接线状态。")
         manifest = create_session(directory, self.source.description)
         self.record_dir = directory
         self.record_count = 0
         self.record_baseline = {**self.stats, "index_gaps": self.index_gaps, "invalid_records": self.decoder.invalid_records,
-                                "frame_errors": self.decoder.frame_errors, "valid_frames": self.decoder.valid_frames}
+                                "frame_errors": self.decoder.frame_errors, "valid_frames": self.decoder.valid_frames,
+                                "packet_gaps": getattr(self.decoder, "sequence_gaps", 0)}
         self.segment_summaries = []
         self.start_cache = []
         self.start_marker = "waiting"
@@ -347,10 +348,13 @@ class AcquisitionController:
             self.writer.writerow(CSV_FIELDS)
             self.binary = (acquisition / "serial.bin").open("wb")
             self.binary.write(bytes(self.decoder.buffer))
+            self.binary.write(bytes(self.probe))
             self.events_stream = (acquisition / "filter_events.jsonl").open("w", encoding="utf-8")
             self.filters = RealtimeFilters(self.settings)
             self.revision += 1
             self.pending_event = "recording_start"
+            if self.four:
+                self._open_four_files()
             self.state = "recording"
             self._last_flush = time.monotonic()
             if hasattr(self.source, "resume"):
@@ -367,6 +371,18 @@ class AcquisitionController:
         self.state = "finalizing"
         try:
             close_errors = []
+            if self.four:
+                try:
+                    self._append_four_rows(self.four.finish())
+                    self.four.flush()
+                except Exception as exc:
+                    complete = False
+                    close_errors.append(str(exc))
+                finally:
+                    try:
+                        self.four.close()
+                    except OSError as exc:
+                        close_errors.append(str(exc))
             for stream in (self.writer_stream, self.binary, self.events_stream):
                 if stream is not None:
                     try:
@@ -385,9 +401,16 @@ class AcquisitionController:
                       "observed_index_gaps": self.index_gaps - self.record_baseline["index_gaps"],
                       "invalid_records": self.decoder.invalid_records - self.record_baseline["invalid_records"],
                       "frame_errors": self.decoder.frame_errors - self.record_baseline["frame_errors"],
+                      "packet_gaps": getattr(self.decoder, "sequence_gaps", 0) - self.record_baseline["packet_gaps"],
                       "valid_frames": self.decoder.valid_frames - self.record_baseline["valid_frames"],
                       "backlog_peak_bytes": self.stats["backlog_peak_bytes"], "display_buffer_limit": self.history.maxlen,
+                      "transport": getattr(self.source, "diagnostics", {}),
                       "note": "Index gaps may include firmware drops; counters are not additive"}
+            if self.four:
+                status = self.four.status()
+                report.update(schema_version=3, protocol_version=2, channel_count=4, clock=status,
+                              native_recorded_samples=self.four.native_recorded, recorded_samples=self.four.record_count,
+                              segment_summaries=self.four.segments, value_type="software_aligned_resampled")
             partial = directory / "acquisition" / "emg.partial.csv"
             if complete and partial.exists():
                 partial.replace(directory / "acquisition" / "emg.csv")
@@ -395,6 +418,8 @@ class AcquisitionController:
             manifest = json.loads((directory / "session.json").read_text(encoding="utf-8"))
             manifest.update(state=report["state"], recorded_samples=self.record_count,
                             emg_csv="acquisition/emg.csv" if complete else "acquisition/emg.partial.csv")
+            if self.four:
+                manifest.update(channel_count=4, protocol_version=2, value_type="software_aligned_resampled")
             write_json(directory / "session.json", manifest)
             self.last_record_dir = directory
             return directory
@@ -416,6 +441,8 @@ class AcquisitionController:
                     self.filters = RealtimeFilters(value)
                     self.revision += 1
                     self.pending_event = "settings_changed"
+                    if self.four:
+                        self.revision = self.four.update_filters(value)
                     result = self.revision
                 elif name == "disconnect":
                     self._stop = True
@@ -427,6 +454,73 @@ class AcquisitionController:
                 future.set_exception(exc)
                 if name in ("start", "stop", "disconnect") and self.record_dir:
                     raise
+
+    def _open_four_files(self):
+        if self.record_count:
+            raise ValueError("Protocol changed within a recording; reconnect before changing firmware target")
+        for stream in (self.writer_stream, self.events_stream):
+            if stream is not None:
+                stream.close()
+        self.writer_stream = self.events_stream = None
+        self.four.open(self.record_dir)
+        self.writer = True  # Recording ownership remains in this worker.
+        with self.lock:
+            self.history.clear()
+            self.view_generation += 1
+
+    def _append_four_rows(self, rows):
+        with self.lock:
+            self.history.extend(rows)
+            self.segment = self.four.segment
+            self.received_samples = self.four.native_count
+            self.record_count = self.four.record_count
+            self.start_marker = self.four.ttl_marker
+            self.index_gaps = sum(c.gaps for c in self.four.aligner.clocks)
+            self.duplicates = sum(c.duplicates for c in self.four.aligner.clocks)
+            self.stats["native_recorded_samples"] = self.four.native_recorded
+            self.stats["firmware_dropped_latest"] = sum(self.four.hardware_status.get(k, 0) for k in ("dropped_a", "dropped_b"))
+            self.clock_snapshot = deepcopy(self.four.status())
+
+    def _decode(self, data):
+        decoded = None
+        if self.protocol is None:
+            self.probe.extend(data)
+            legacy = FrameDecoder()
+            legacy_frames = legacy.feed(bytes(self.probe))
+            modern = V2Decoder()
+            modern_packets = modern.feed(bytes(self.probe))
+            if not legacy_frames and not modern_packets:
+                if len(self.probe) > 1040:
+                    del self.probe[:-1040]
+                    self.decoder.frame_errors += 1
+                return
+            if legacy_frames and modern_packets:
+                raise ValueError("Mixed valid v1/v2 protocols in one connection; reconnect after changing firmware")
+            self.protocol = 2 if modern_packets else 1
+            self.decoder = modern if self.protocol == 2 else legacy
+            decoded = modern_packets if self.protocol == 2 else legacy_frames
+            self.probe.clear()
+            if self.protocol == 2:
+                bootstrap = None
+                path = getattr(self.source, "path", None)
+                if path and (Path(path).parent / "metadata.json").is_file():
+                    bootstrap = json.loads((Path(path).parent / "metadata.json").read_text(encoding="utf-8"))
+                self.four = FourChannelRecorder(self.settings, bootstrap)
+                if self.record_dir:
+                    self._open_four_files()
+        for item in decoded if decoded is not None else self.decoder.feed(data):
+            if self.protocol == 1:
+                self._process_frame(item)
+            else:
+                native_before = self.four.native_count
+                rows, reset = self.four.on_packet(item)
+                if reset:
+                    with self.lock:
+                        self.history.clear()
+                    rows = [row for row in rows if row[7] == self.four.segment]
+                self._append_four_rows(rows)
+                if self.four.native_count != native_before:
+                    self.last_sample_at = time.monotonic()
 
     def _process_frame(self, samples: list[Sample]):
         # Split at resets/gaps so filter state never bridges an invalid interval.
@@ -503,14 +597,16 @@ class AcquisitionController:
                         self.stats["raw_bytes"] += len(data)
                     if self.binary:
                         self.binary.write(data)
-                    for samples in self.decoder.feed(data):
-                        self._process_frame(samples)
+                    self._decode(data)
                 elif self.source.eof:
                     self._finalize("replay_eof", True)
                     break
                 if self.writer and time.monotonic() - self._last_flush >= 1:
                     for stream in (self.writer_stream, self.binary, self.events_stream):
-                        stream.flush()
+                        if stream is not None:
+                            stream.flush()
+                    if self.four:
+                        self.four.flush()
                     self._last_flush = time.monotonic()
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"

@@ -28,6 +28,9 @@ def _run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--marker-threshold", type=int)
     parser.add_argument("--sync-only", action="store_true")
     parser.add_argument("--video-analysis", type=Path)
+    parser.add_argument('--bl-csv', type=Path)
+    parser.add_argument('--stimulus-parameters', type=Path)
+    parser.add_argument('--coordinate-mode', choices=['pixel', 'metric'])
 
 
 def _value(args: argparse.Namespace, config: dict, key: str, argument: str | None = None, default=None):
@@ -84,6 +87,10 @@ def build_run_config(args: argparse.Namespace) -> RunConfig:
         allow_constant_fps_fallback=bool(values.get("allow_constant_fps_fallback", False)),
         video_analysis_dir=Path(cached) if cached else None,
         max_alignment_residual_frames=float(values.get("max_alignment_residual_frames", 1.0)),
+        bl_csv=Path(_value(args, values, 'bl_csv')) if _value(args, values, 'bl_csv') else None,
+        stimulus_parameters_path=Path(_value(args, values, 'stimulus_parameters_path', 'stimulus_parameters')) if _value(args, values, 'stimulus_parameters_path', 'stimulus_parameters') else None,
+        coordinate_mode=_value(args, values, 'coordinate_mode', default='metric'),
+        bl_rms_limit_ms=float(values.get('bl_rms_limit_ms', 1)), bl_max_limit_ms=float(values.get('bl_max_limit_ms', 2)),
     )
 
 
@@ -101,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     record.add_argument("--output", type=Path, required=True)
     record.add_argument("--seconds", type=float, default=0, help="Wall time for serial, simulated duration for --simulate")
     record.add_argument("--speed", type=float, default=1)
+    record.add_argument("--channels", type=int, choices=[2, 4], default=2, help="Simulation channels; serial/replay auto-detect the protocol")
     analyze = commands.add_parser("analyze-video", help="Standalone LED and/or marker analysis without EMG")
     _run_args(analyze)
     validate = commands.add_parser("validate", help="Run persistent software/real-sync acceptance suite")
@@ -112,6 +120,14 @@ def main(argv: list[str] | None = None) -> int:
     review.add_argument("--count", type=int, default=30)
     replay = commands.add_parser("index-replay", help="Build/reuse synchronized disk replay indexes")
     replay.add_argument("--result", type=Path, required=True)
+    bl = commands.add_parser('inspect-bl', help='Inspect strict BL TTL and pulse-start annotations')
+    bl.add_argument('--csv', type=Path, required=True)
+    bl.add_argument('--parameters', type=Path)
+    bl.add_argument('--output', type=Path, required=True)
+    package = commands.add_parser('package-replay', help='Export a self-contained portable replay directory')
+    package.add_argument('--result', type=Path, required=True)
+    package.add_argument('--output', type=Path, required=True)
+    package.add_argument('--include-raw', action='store_true')
     roi = commands.add_parser("select-roi", help="Choose an ROI on the video")
     roi.add_argument("--video", type=Path, required=True)
     roi.add_argument("--label", default="LED")
@@ -139,7 +155,9 @@ def main(argv: list[str] | None = None) -> int:
         launch()
     elif args.command == "record":
         from .acquisition import AcquisitionController, BinaryReplaySource, SimulatedSource
-        source = BinaryReplaySource(args.replay, args.speed) if args.replay else SimulatedSource(args.seconds or 1800, args.speed) if args.simulate else None
+        from .simulated_v2 import SimulatedFourChannelSource
+        simulator = SimulatedFourChannelSource if args.channels == 4 else SimulatedSource
+        source = BinaryReplaySource(args.replay, args.speed) if args.replay else simulator(args.seconds or 1800, args.speed) if args.simulate else None
         controller = AcquisitionController()
         controller.connect(port=args.port, source=source)
         try:
@@ -186,6 +204,24 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "index-replay":
         from .replay import build_replay_index
         print(json.dumps(build_replay_index(args.result, progress=print), indent=2, ensure_ascii=False))
+    elif args.command == 'inspect-bl':
+        from .bl422 import load_bl422, export_parameter_template
+        from .stimulus_sync import analog_ttl, protocol
+        from .session import write_json
+        args.output.mkdir(parents=True, exist_ok=False)
+        with load_bl422(args.csv, parameters_path=args.parameters) as record:
+            report = record.summary()
+            ttl, voltage = analog_ttl(record)
+            p = protocol(ttl)
+            report['ttl'] = {k: v for k, v in p.items() if k not in ('levels', 'stable_indices')}
+            report['ttl']['stable_edges'] = len(p['stable_indices'])
+            report['voltage_detection'] = voltage
+            write_json(args.output/'bl_import_report.json', report)
+            export_parameter_template(record, args.output/'stimulus_parameters.csv')
+            print(json.dumps({'samples': len(record.samples), 'events': len(record.events), 'start_s': p['start_s']}))
+    elif args.command == 'package-replay':
+        from .result_store import export_replay_package
+        print(json.dumps(export_replay_package(args.result, args.output, include_raw=args.include_raw, progress=print), ensure_ascii=False))
     elif args.command == "select-roi":
         chosen = select_roi(args.video, args.label, args.intrinsics)
         print(f"{chosen.x},{chosen.y},{chosen.w},{chosen.h}")

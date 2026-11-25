@@ -59,8 +59,10 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(ADS_CS_GPIO_Port, ADS_CS_Pin, GPIO_PIN_SET);
 
-  /*Configure GPIO pins : B1_Pin ADS1292_DRDY_Pin */
-  GPIO_InitStruct.Pin = B1_Pin|ADS1292_DRDY_Pin;
+  GPIO_InitStruct.Pin = B1_Pin;
+#ifndef NEUROMOTION_DUAL_ADC
+  GPIO_InitStruct.Pin |= ADS1292_DRDY_Pin;
+#endif
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
@@ -80,8 +82,10 @@ void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
+#ifndef NEUROMOTION_DUAL_ADC
   HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+#endif
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 

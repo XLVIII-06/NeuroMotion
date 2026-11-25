@@ -30,6 +30,24 @@ class SignalSession:
     ch1_filtered_uv: np.ndarray | None = None
     ch2_filtered_uv: np.ndarray | None = None
     filter_revision: np.ndarray | None = None
+    aligned_channels_uv: np.ndarray | None = None
+    filtered_channels_uv: np.ndarray | None = None
+    channel_quality: np.ndarray | None = None
+    filter_quality: np.ndarray | None = None
+    mcu_time_us: np.ndarray | None = None
+    common_time_s: np.ndarray | None = None
+    sync_positions: np.ndarray | None = None
+    storage_owner: object = field(default=None, repr=False, compare=False)
+
+    @property
+    def channel_count(self):
+        return 4 if self.aligned_channels_uv is not None else 2
+
+    def channel(self, index, filtered=False):
+        matrix = self.filtered_channels_uv if filtered else self.aligned_channels_uv
+        if matrix is not None:
+            return matrix[:, index]
+        return (self.ch1_filtered_uv, self.ch2_filtered_uv)[index] if filtered else (self.ch1_uv, self.ch2_uv)[index]
 
     @property
     def raw_available(self) -> bool:
@@ -43,6 +61,10 @@ class SignalSession:
 
 def load_signal_sessions(path: str | Path) -> list[SignalSession]:
     path = Path(path)
+    header = pd.read_csv(path, encoding="utf-8-sig", nrows=0)
+    if "ch4_aligned_uv" in header:
+        from .signals_v2 import load_four_sessions
+        return load_four_sessions(path)
     frame = pd.read_csv(path, encoding="utf-8-sig")
     if frame.empty:
         raise SignalInputError("EMG CSV is empty")

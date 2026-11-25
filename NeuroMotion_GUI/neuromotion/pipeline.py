@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -47,10 +48,23 @@ class RunConfig:
     allow_constant_fps_fallback: bool = False
     video_analysis_dir: Path | None = None
     max_alignment_residual_frames: float = 1.0
+    bl_csv: Path | None = None
+    stimulus_parameters_path: Path | None = None
+    bl_rms_limit_ms: float = 1.0
+    bl_max_limit_ms: float = 2.0
+    coordinate_mode: str = 'metric'
 
     def validate(self) -> None:
         if not self.emg_csv.is_file() or not self.video_path.is_file():
             raise ValueError("EMG CSV and video must exist")
+        if self.coordinate_mode not in ('pixel', 'metric'):
+            raise ValueError('Coordinate mode must be pixel or metric')
+        if not np.isfinite([self.bl_rms_limit_ms, self.bl_max_limit_ms]).all() or min(self.bl_rms_limit_ms, self.bl_max_limit_ms) <= 0:
+            raise ValueError('BL residual limits must be positive and finite')
+        if self.bl_csv is not None and not self.bl_csv.is_file():
+            raise ValueError('BL CSV does not exist')
+        if self.stimulus_parameters_path is not None and (self.bl_csv is None or not self.stimulus_parameters_path.is_file()):
+            raise ValueError('Stimulus parameters require a BL CSV and an existing parameter file')
         if self.nominal_rate_hz <= 0 or self.max_motion_gap_s <= 0:
             raise ValueError("Sample rate and motion interpolation gap must be positive")
         if self.marker_count < 1 or self.max_emg_gap_samples < 1:
@@ -71,9 +85,11 @@ class RunConfig:
         if not 0 < self.max_alignment_residual_frames <= 1:
             raise ValueError("Formal alignment residual limit must be within one frame")
         if not self.sync_only and self.video_analysis_dir is None:
-            if self.marker_roi is None or self.intrinsics_path is None or self.homography_path is None:
+            if self.marker_roi is None:
+                raise ValueError('Marker ROI is required')
+            if self.coordinate_mode == 'metric' and (self.intrinsics_path is None or self.homography_path is None):
                 raise ValueError("Full fusion needs marker ROI, intrinsics and homography")
-            if not self.intrinsics_path.is_file() or not self.homography_path.is_file():
+            if any(p is not None and not p.is_file() for p in (self.intrinsics_path, self.homography_path)):
                 raise ValueError("Calibration files do not exist")
 
 
@@ -88,7 +104,7 @@ def _file_info(path: Path) -> dict:
 def _write_quality_details(output: Path, trace: VideoTrace, session: SignalSession, alignment: Alignment, rate: float) -> dict:
     stream, writer = _csv_writer(output / "ttl_edge_matches.csv", ["edge_number", "video_time_s", "emg_sample_index", "rising", "common_time_s", "residual_s"])
     with stream:
-        writer.writerows(iter_matched_edges(trace.led_state, trace.time_s, session.sync, session.sample_index, alignment, rate))
+        writer.writerows(iter_matched_edges(trace.led_state, trace.time_s, session.sync, session.sync_positions if session.sync_positions is not None else session.sample_index, alignment, rate))
     summary = {"emg_missing_index_samples": session.missing_index_samples, "video_gap_count": 0,
                "firmware_dropped_counter_max": int(session.dropped_samples.max()),
                "pc_missing_counter_max": int(session.pc_missing_samples.max())}
@@ -119,10 +135,15 @@ def _select_session(trace: VideoTrace, sessions: list[SignalSession], rate: floa
             rates = session.metadata.get("sample_rate_hz", [])
             if rates and (len(rates) != 1 or abs(rates[0] - rate) > 0.01):
                 raise AlignmentError("CSV sample_rate_hz metadata disagrees with configured nominal rate")
+            if session.channel_count == 4 and (not session.metadata.get("sync_valid") or session.metadata.get("master_start_sample") is None or session.metadata.get("hardware_edge_count",0) < 10):
+                raise AlignmentError("Four-channel alignment needs valid captured TTL edges and a known MCU start anchor")
             alignment = fit_session_alignment(
-                trace.led_state, trace.time_s, session.sync, session.sample_index,
+                trace.led_state, trace.time_s, session.sync, session.sync_positions if session.sync_positions is not None else session.sample_index,
                 session_number=session.session_number, nominal_rate_hz=rate, max_residual_frames=max_residual_frames,
             )
+            if session.channel_count == 4:
+                from dataclasses import replace
+                alignment = replace(alignment, master_start_sample=session.metadata["master_start_sample"], master_rate_hz=1000.)
             matches.append((session, alignment))
         except AlignmentError as exc:
             rejected[str(session.session_number)] = str(exc)
@@ -150,7 +171,52 @@ def _check_cancel(cancel_event) -> None:
 BRANCH_FRAME_FIELDS = ["emg_ch1_raw_uv_at_frame", "emg_ch2_raw_uv_at_frame", "emg_ch1_filtered_uv_at_frame", "emg_ch2_filtered_uv_at_frame", "filtered_value_type"]
 
 
+def _frame_fields(session):
+    if session.channel_count == 2:
+        return BRANCH_FRAME_FIELDS
+    return [f"emg_ch{i}_{kind}" for i in range(1,5) for kind in
+            ("uv_at_frame", "aligned_uv_at_frame", "filtered_uv_at_frame", "value_type", "filtered_value_type")]
+
+
+def _sample_channels(session, sample_float, max_gap, filtered=False):
+    ids=session.sample_index
+    right=int(np.searchsorted(ids,sample_float,side="left"))
+    exact=right<len(ids) and abs(float(ids[right])-sample_float)<1e-9
+    if not exact and (right==0 or right>=len(ids)):
+        return [None]*session.channel_count,["outside_emg"]*session.channel_count
+    left=right if exact else right-1
+    if not exact and ids[right]-ids[left]>max_gap:
+        return [None]*session.channel_count,["emg_gap"]*session.channel_count
+    if filtered and not exact and session.filter_revision is not None and session.filter_revision[left]!=session.filter_revision[right]:
+        return [None]*session.channel_count,["filter_revision_boundary"]*session.channel_count
+    fraction=0 if exact else (sample_float-ids[left])/(ids[right]-ids[left])
+    result=[];flags=[]
+    for ch in range(session.channel_count):
+        array=session.channel(ch,filtered)
+        if array is None:
+            result.append(None);flags.append("not_available");continue
+        first,second=float(array[left]),float(array[right])
+        if not math.isfinite(first) or not math.isfinite(second):
+            reason="emg_gap"
+            quality=session.filter_quality if filtered else session.channel_quality
+            if quality is not None:
+                from .signals_v2 import QUALITY_NAMES
+                j=left if not math.isfinite(first) else right
+                reason=QUALITY_NAMES[int(quality[j,ch])]
+            result.append(None);flags.append(reason)
+        else:
+            result.append(first+fraction*(second-first));flags.append("observed" if exact else "interpolated")
+    return result,flags
+
+
 def _frame_branches(session: SignalSession, sample_float: float, max_gap: int, raw1, raw2) -> dict:
+    if session.channel_count == 4:
+        values,quality=_sample_channels(session,sample_float,max_gap)
+        filtered,fquality=_sample_channels(session,sample_float,max_gap,True)
+        return {key:value for ch in range(4) for key,value in
+                ((f"emg_ch{ch+1}_uv_at_frame",values[ch]),(f"emg_ch{ch+1}_aligned_uv_at_frame",values[ch]),
+                 (f"emg_ch{ch+1}_filtered_uv_at_frame",filtered[ch]),(f"emg_ch{ch+1}_value_type",quality[ch]),
+                 (f"emg_ch{ch+1}_filtered_value_type",fquality[ch]))}
     first = second = None
     kind = "not_available"
     if session.ch1_filtered_uv is not None:
@@ -175,6 +241,14 @@ def _frame_branches(session: SignalSession, sample_float: float, max_gap: int, r
 
 
 def _interpolate_emg(session: SignalSession, sample_float: float, max_gap: int) -> tuple[int | None, int | None, float | None, float | None, str]:
+    if session.channel_count == 4:
+        values,quality=_sample_channels(session,sample_float,max_gap)
+        ids=session.sample_index;right=int(np.searchsorted(ids,sample_float,side="left"))
+        if right>=len(ids) or (right==0 and abs(float(ids[0])-sample_float)>1e-9):
+            return None,None,None,None,"outside_emg"
+        exact=abs(float(ids[right])-sample_float)<1e-9
+        kind=("observed" if exact else "interpolated") if all(v is not None for v in values) else "partial_emg"
+        return int(ids[right if exact else right-1]),int(ids[right]),values[0],values[1],kind
     ids = session.sample_index
     index = int(np.searchsorted(ids, sample_float, side="left"))
     if index < len(ids) and abs(float(ids[index]) - sample_float) < 1e-9:
@@ -192,7 +266,7 @@ def _interpolate_emg(session: SignalSession, sample_float: float, max_gap: int) 
 
 def _write_frame_alignment(path: Path, trace: VideoTrace, session: SignalSession, alignment: Alignment, max_emg_gap: int, cancel_event=None) -> None:
     fields = ["frame_index", "video_time_s", "common_time_s", "led_state", "emg_sample_float", "emg_sample_before", "emg_sample_after", "emg_ch1_uv_at_frame", "emg_ch2_uv_at_frame", "emg_value_type"]
-    stream, writer = _csv_writer(path, fields + BRANCH_FRAME_FIELDS)
+    stream, writer = _csv_writer(path, list(dict.fromkeys(fields + _frame_fields(session))))
     with stream:
         for i in range(len(trace.frame_index)):
             if i % 300 == 0:
@@ -213,7 +287,7 @@ def _write_frame_alignment(path: Path, trace: VideoTrace, session: SignalSession
 
 def _write_frame_fusion(path: Path, trace: VideoTrace, session: SignalSession, alignment: Alignment, tracking: TrackingData, max_emg_gap: int, cancel_event=None) -> None:
     fields = ["frame_index", "video_time_s", "common_time_s", "led_state", "emg_sample_float", "emg_sample_before", "emg_sample_after", "emg_ch1_uv_at_frame", "emg_ch2_uv_at_frame", "emg_value_type", "particle_id", "u_px", "v_px", "X_mm", "Y_mm", "detected", "quality_flag"]
-    stream, writer = _csv_writer(path, fields + BRANCH_FRAME_FIELDS)
+    stream, writer = _csv_writer(path, list(dict.fromkeys(fields + _frame_fields(session))))
     marker_count = tracking.marker_count
     rows = tracking.rows()
     with stream:
@@ -244,7 +318,12 @@ def _write_frame_fusion(path: Path, trace: VideoTrace, session: SignalSession, a
 
 def _write_sample_fusion(path: Path, session: SignalSession, alignment: Alignment, trace: VideoTrace, tracking: TrackingData, max_motion_gap_s: float, cancel_event=None) -> None:
     fields = ["sample_index", "common_time_s", "ch1_uv", "ch2_uv", "signal_kind", "sync", "dropped_samples", "pc_missing_samples", "particle_id", "u_px", "v_px", "X_mm", "Y_mm", "motion_value_type", "quality_flag"]
-    stream, writer = _csv_writer(path, fields + ["ch1_raw_uv", "ch2_raw_uv", "ch1_filtered_uv", "ch2_filtered_uv", "filter_revision"])
+    extras = []
+    if session.channel_count == 4:
+        extras = ["ch3_uv","ch4_uv","ch3_filtered_uv","ch4_filtered_uv","mcu_time_us"]
+        extras += [f"ch{ch}_aligned_uv" for ch in range(1,5)]
+        extras += [f"quality_ch{ch}" for ch in range(1,5)] + [f"filter_quality_ch{ch}" for ch in range(1,5)]
+    stream, writer = _csv_writer(path, fields + ["ch1_raw_uv", "ch2_raw_uv", "ch1_filtered_uv", "ch2_filtered_uv", "filter_revision"] + extras)
     count = tracking.marker_count
     frame_count = len(trace.frame_index)
     before = [-1] * count
@@ -274,8 +353,16 @@ def _write_sample_fusion(path: Path, session: SignalSession, alignment: Alignmen
                 "ch2_filtered_uv": float(session.ch2_filtered_uv[i]) if session.ch2_filtered_uv is not None else None,
                 "filter_revision": int(session.filter_revision[i]) if session.filter_revision is not None else None,
             }
+            if session.channel_count == 4:
+                from .signals_v2 import QUALITY_NAMES
+                base.update({f"ch{ch+1}_aligned_uv":float(session.channel(ch)[i]) for ch in range(4)})
+                base.update({f"ch{ch+1}_uv":float(session.channel(ch)[i]) for ch in (2,3)})
+                base.update({f"ch{ch+1}_filtered_uv":float(session.channel(ch,True)[i]) for ch in (2,3)})
+                base.update({f"quality_ch{ch+1}":QUALITY_NAMES[int(session.channel_quality[i,ch])] for ch in range(4)})
+                base.update({f"filter_quality_ch{ch+1}":QUALITY_NAMES[int(session.filter_quality[i,ch])] for ch in range(4)})
+                base["mcu_time_us"]=int(session.mcu_time_us[i])
             for particle_id in range(count):
-                while after[particle_id] < frame_count and float(trace.time_s[after[particle_id]] - alignment.video_start_s) < common_time - 1e-9:
+                while after[particle_id] < frame_count and float(alignment.common_time_from_video(trace.time_s[after[particle_id]])) < common_time - 1e-9:
                     before[particle_id] = after[particle_id]
                     after[particle_id] = next_observed(particle_id, after[particle_id] + 1)
                 first, last = before[particle_id], after[particle_id]
@@ -283,14 +370,14 @@ def _write_sample_fusion(path: Path, session: SignalSession, alignment: Alignmen
                 kind, quality = "missing", "outside_motion" if first < 0 or last >= frame_count else "motion_gap"
                 if last < frame_count:
                     row = tracking.records[last * count + particle_id]
-                    last_time = float(trace.time_s[last] - alignment.video_start_s)
+                    last_time = float(alignment.common_time_from_video(trace.time_s[last]))
                     if abs(last_time - common_time) <= 1e-9:
                         position = {key: float(row[key]) for key in position}
                         kind = "observed"
                         quality = "observed" if row["quality"] == 1 else "reacquired_unverified"
                     elif first >= 0:
                         previous = tracking.records[first * count + particle_id]
-                        first_time = float(trace.time_s[first] - alignment.video_start_s)
+                        first_time = float(alignment.common_time_from_video(trace.time_s[first]))
                         gap = last_time - first_time
                         if row["quality"] != 1 or previous["quality"] != 1:
                             quality = "reacquired_unverified"
@@ -330,10 +417,30 @@ def run_pipeline(config: RunConfig, progress: Callable[[str], None] | None = Non
         cached_analysis = None
         if config.video_analysis_dir:
             from .video_analysis import load_video_analysis
-            trace, tracking, cached_analysis = load_video_analysis(config.video_analysis_dir, report["input_files"]["video"], not config.sync_only)
+            trace, tracking, cached_analysis = load_video_analysis(config.video_analysis_dir, report["input_files"]["video"], not config.sync_only,
+                                                                  require_metric=config.coordinate_mode == 'metric')
             report["reused_video_analysis"] = str(config.video_analysis_dir.resolve())
             for key in ("led_roi", "marker_roi", "marker_count", "intrinsics_path", "homography_path"):
                 report["config"][key] = cached_analysis["config"].get(key)
+            if tracking is not None and config.coordinate_mode == 'pixel':
+                # Cached metric coordinates must not silently survive an explicit
+                # pixel-only run. Copy in bounded blocks, leaving the cache intact.
+                from .storage import close_mapping
+                records = np.memmap(Path(workspace.name)/'pixel_tracking.bin', mode='w+',
+                                    dtype=tracking.records.dtype, shape=tracking.records.shape)
+                try:
+                    for start in range(0, len(records), 4096):
+                        _check_cancel(cancel_event)
+                        records[start:start+4096] = tracking.records[start:start+4096]
+                        records['X_mm'][start:start+4096] = np.nan
+                        records['Y_mm'][start:start+4096] = np.nan
+                except BaseException:
+                    close_mapping(records)
+                    raise
+                tracking.close()
+                tracking = TrackingData(records, tracking.marker_count)
+                cached_analysis['calibration']['homography'] = None
+                report['config']['homography_path'] = None
         else:
             trace = scan_video_led(
                 config.video_path, config.led_roi, threshold=config.led_threshold,
@@ -342,7 +449,7 @@ def run_pipeline(config: RunConfig, progress: Callable[[str], None] | None = Non
             )
         trace.write_csv(output / "video_ttl.csv")
         report["video"] = {"frame_count": len(trace.frame_index), "width": trace.width, "height": trace.height, "fps_reported": trace.fps_reported, "timestamp_source": trace.timestamp_source, "led_metric": trace.metric, "led_threshold": trace.threshold, "led_edges": sum(1 for _ in iter_edges(trace.led_state, trace.time_s))}
-        report["processing"] = {"video_metadata_storage": "disk_backed", "tracking_metadata_storage": "disk_backed", "metadata_chunk_rows": 4096, "decoded_frame_buffer": "current raw/undistorted frame only", "emg_storage": "in_memory"}
+        report["processing"] = {"video_metadata_storage": "disk_backed", "tracking_metadata_storage": "disk_backed", "metadata_chunk_rows": 4096, "decoded_frame_buffer": "current raw/undistorted frame only", "emg_storage": "disk_backed_chunked" if any(s.channel_count==4 for s in sessions) else "in_memory"}
         report["timing_limits"] = {"absolute_emg_motion_latency_calibrated": False,
                                    "unmeasured_delays": ["ADS1292R digital filter group delay", "DRDY sync sampling phase", "LED response", "camera exposure and rolling shutter"]}
         report["warnings"] = []
@@ -350,6 +457,8 @@ def run_pipeline(config: RunConfig, progress: Callable[[str], None] | None = Non
             report["warnings"].append("Frame timestamps replaced by FPS only because the user explicitly enabled constant-FPS fallback")
         announce("识别起始编码并拟合 TTL 时间轴")
         session, alignment, rejected = _select_session(trace, sessions, config.nominal_rate_hz, config.max_alignment_residual_frames)
+        if session.channel_count == 4:
+            report["input_files"]["sync_edges"] = _file_info(Path(session.metadata["sync_edges_path"]))
         report["alignment"] = alignment.as_dict()
         report["rejected_sessions"] = rejected
         report["data_quality"] = _write_quality_details(output, trace, session, alignment, config.nominal_rate_hz)
@@ -366,10 +475,10 @@ def run_pipeline(config: RunConfig, progress: Callable[[str], None] | None = Non
         else:
             announce("逐帧追踪反光点并换算平面坐标")
             if tracking is None:
-                assert config.marker_roi is not None and config.intrinsics_path is not None and config.homography_path is not None
+                assert config.marker_roi is not None
                 tracking = track_video_markers(
                 config.video_path, trace, config.marker_roi, marker_count=config.marker_count,
-                intrinsics_path=config.intrinsics_path, homography_path=config.homography_path,
+                intrinsics_path=config.intrinsics_path, homography_path=config.homography_path if config.coordinate_mode == 'metric' else None,
                 threshold=config.marker_threshold, min_area=config.marker_min_area,
                 max_area=config.marker_max_area, min_circularity=config.marker_min_circularity,
                 search_range_px=config.marker_search_range_px, memory_frames=config.marker_memory_frames,
@@ -393,11 +502,24 @@ def run_pipeline(config: RunConfig, progress: Callable[[str], None] | None = Non
             tracking_temp.replace(output / "tracking.csv")
             frame_temp.replace(output / "aligned_by_frame.csv")
             sample_temp.replace(output / "aligned_by_emg_sample.csv")
-            report["calibration"] = cached_analysis["calibration"] if cached_analysis else {"intrinsics": _file_info(config.intrinsics_path), "homography": _file_info(config.homography_path)}
+            report["calibration"] = cached_analysis["calibration"] if cached_analysis else {
+                "intrinsics": _file_info(config.intrinsics_path) if config.intrinsics_path else None,
+                "homography": _file_info(config.homography_path) if config.coordinate_mode == 'metric' and config.homography_path else None}
+            report['millimeter_coordinates'] = bool(report['calibration'].get('homography'))
             report["marker_coverage"] = tracking.coverage()
             report["status"] = "full_fusion_generated"
             report["full_fusion_validated"] = False  # requires the planned manual 30-frame review
+        from .stimulus_fusion import write_signal_product, fuse_stimulus
+        from .result_store import write_result_manifest
+        announce('保存可独立重建回放的信号产物')
+        write_signal_product(output/'replay_signals.csv', session, alignment, cancel_event)
+        coverage = None
+        if config.bl_csv is not None:
+            announce('导入 BL TTL 与单脉冲标注，直接匹配主时钟')
+            coverage = fuse_stimulus(config, report, session, alignment, trace, cancel_event)
+        report['result_manifest'] = 'result_manifest.json'
         (output / "alignment_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_result_manifest(output, report, session, coverage)
         if progress:
             progress(f"完成：{output}")
         return report
@@ -409,6 +531,8 @@ def run_pipeline(config: RunConfig, progress: Callable[[str], None] | None = Non
         (output / "alignment_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         raise
     finally:
+        owners={id(s.storage_owner):s.storage_owner for s in locals().get("sessions",[]) if s.storage_owner is not None}
+        for owner in owners.values():owner.close()
         if tracking is not None:
             tracking.close()
         if trace is not None:

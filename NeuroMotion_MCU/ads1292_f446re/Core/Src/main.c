@@ -29,6 +29,9 @@
 #include "ads1292.h"
 #include "sample_stream.h"
 #include "sync_signal.h"
+#ifdef NEUROMOTION_DUAL_ADC
+#include "dual_adc.h"
+#endif
 
 /* USER CODE END Includes */
 
@@ -99,6 +102,11 @@ int main(void)
   MX_DAC_Init();
   /* USER CODE BEGIN 2 */
   SyncSignal_InitIdle();
+#ifdef NEUROMOTION_DUAL_ADC
+  uint8_t ready = DualADC_Init();
+  HAL_Delay(5000U);
+  if (ready == 3U) { SyncSignal_Start(); DualADC_Start(); }
+#else
   if (ADS1292_Init() != HAL_OK)
   {
     Error_Handler();
@@ -111,6 +119,7 @@ int main(void)
   {
     Error_Handler();
   }
+#endif
 
   /* USER CODE END 2 */
 
@@ -122,7 +131,11 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     SyncSignal_Process();
+#ifdef NEUROMOTION_DUAL_ADC
+    DualADC_Process();
+#else
     SampleStream_Process();
+#endif
   }
   /* USER CODE END 3 */
 }

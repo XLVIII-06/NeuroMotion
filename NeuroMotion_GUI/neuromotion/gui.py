@@ -84,6 +84,9 @@ class NeuroMotionApp(tk.Tk):
         self.output = tk.StringVar(value=str(self._new_output()))
         self.video_output = tk.StringVar(value=str(self._new_output().with_name("video_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))))
         self.analysis_cache = tk.StringVar()
+        self.bl_csv = tk.StringVar()
+        self.stimulus_parameters = tk.StringVar()
+        self.pixel_only = tk.BooleanVar(value=False)
         self.extract_led = tk.BooleanVar(value=True)
         self.extract_markers = tk.BooleanVar(value=True)
         self.led_roi = tk.StringVar()
@@ -196,6 +199,9 @@ class NeuroMotionApp(tk.Tk):
         self.live_page.pack(fill="both", expand=True)
         self.replay_page = ReplayPage(self.book, self)
         self.book.add(self.replay_page, text="同步回放")
+        from .bl_ui import BLPage
+        self.bl_page = BLPage(self.book, self)
+        self.book.add(self.bl_page, text='BL 刺激数据')
         self.bind("<MouseWheel>", self._scroll_form, add="+")
         self._build_analysis()
         self._build_video_page()
@@ -222,6 +228,9 @@ class NeuroMotionApp(tk.Tk):
         self._row(files, 1, "原始视频", self.video, lambda: self._browse_file(self.video, [("视频", "*.mp4 *.mov *.avi *.mkv")]))
         self._row(files, 2, "本次输出目录", self.output, lambda: self._browse_folder(self.output), "选择目录")
         self._row(files, 3, "已有视频分析（可选）", self.analysis_cache, lambda: self._browse_folder(self.analysis_cache), "选择结果")
+        self._row(files, 4, 'BL TTL / 事件（可选）', self.bl_csv, lambda: self._browse_file(self.bl_csv, [('BL CSV','*.csv')]))
+        self._row(files, 5, '纸面参数表（可选）', self.stimulus_parameters, lambda: self._browse_file(self.stimulus_parameters, [('参数 CSV','*.csv')]))
+        ttk.Checkbutton(self.analysis, text='先验证像素坐标（毫米列留空）', variable=self.pixel_only).pack(anchor='w', pady=(0, 5))
         mode = ttk.Frame(self.analysis)
         mode.pack(fill="x", pady=(0, 8))
         ttk.Checkbutton(mode, text="仅验证 LED / TTL 同步", variable=self.sync_only).pack(side="left")
@@ -424,6 +433,9 @@ class NeuroMotionApp(tk.Tk):
             marker_threshold=int(self.marker_threshold.get()), **self.extra_options,
             allow_constant_fps_fallback=self.allow_fps_fallback.get(),
             video_analysis_dir=Path(self.analysis_cache.get()).resolve() if self.analysis_cache.get() else None,
+            bl_csv=Path(self.bl_csv.get()).resolve() if self.bl_csv.get().strip() else None,
+            stimulus_parameters_path=Path(self.stimulus_parameters.get()).resolve() if self.stimulus_parameters.get().strip() else None,
+            coordinate_mode='pixel' if self.pixel_only.get() else 'metric',
         )
 
     def _apply_config(self, values: dict, base: Path) -> None:
@@ -436,9 +448,10 @@ class NeuroMotionApp(tk.Tk):
             "led_metric": self.led_metric, "led_threshold": self.led_threshold,
             "marker_threshold": self.marker_threshold,
             "video_analysis_dir": self.analysis_cache,
+            'bl_csv': self.bl_csv, 'stimulus_parameters_path': self.stimulus_parameters,
         }
         defaults = RunConfig(Path(), Path(), Path(), Rect(0, 0, 1, 1))
-        path_keys = {"emg_csv", "video_path", "output_dir", "intrinsics_path", "homography_path", "video_analysis_dir"}
+        path_keys = {"emg_csv", "video_path", "output_dir", "intrinsics_path", "homography_path", "video_analysis_dir", 'bl_csv', 'stimulus_parameters_path'}
         for key, variable in text_vars.items():
             value = values.get(key, getattr(defaults, key))
             if key in path_keys and value:
@@ -453,7 +466,8 @@ class NeuroMotionApp(tk.Tk):
             variable.set(roi or "")
         self.sync_only.set(bool(values.get("sync_only", False)))
         self.allow_fps_fallback.set(bool(values.get("allow_constant_fps_fallback", False)))
-        exposed = set(text_vars) | {"led_roi", "marker_roi", "sync_only", "allow_constant_fps_fallback"}
+        self.pixel_only.set(values.get('coordinate_mode', 'metric') == 'pixel')
+        exposed = set(text_vars) | {"led_roi", "marker_roi", "sync_only", "allow_constant_fps_fallback", 'coordinate_mode'}
         self.extra_options = {field.name: values[field.name] for field in fields(RunConfig) if field.name not in exposed and field.name in values}
 
     def _load_sample(self) -> None:
@@ -642,7 +656,7 @@ class NeuroMotionApp(tk.Tk):
             elif status == "full_fusion_generated":
                 note += " 两种粒度的融合表已生成；请按实施计划人工抽查位置与 ID。"
         self.result_note.set(note)
-        tables = [name for name in ("aligned_by_frame.csv", "aligned_by_emg_sample.csv", "tracking.csv", "frame_alignment.csv", "video_ttl.csv") if (directory / name).is_file()]
+        tables = [name for name in ("aligned_by_frame.csv", "aligned_by_emg_sample.csv", 'stimulus_events.csv', 'bl_ttl_edge_matches.csv', "tracking.csv", "frame_alignment.csv", "video_ttl.csv") if (directory / name).is_file()]
         self.table_combo.configure(values=tables)
         self.table_name.set(tables[0] if tables else "")
         self._show_table()
@@ -769,6 +783,13 @@ class NeuroMotionApp(tk.Tk):
                     elif result.get("status") == "replay_ready":
                         self.replay_page.set_engine(result["engine"])
                         message = "同步回放已就绪"
+                    elif result.get('status') == 'bl_preview_ready':
+                        self.bl_page.show_summary(result['summary'])
+                        message = 'BL TTL 与刺激标注已导入；纸面参数可补录'
+                    elif result.get('status') == 'video_relocated':
+                        message = '视频内容核对通过；请重新载入回放。'
+                    elif result.get('status') == 'replay_package_complete':
+                        message = '便携回放包完成：'+result['directory']
                     self.status.set(message)
                     self._log(message)
         except queue.Empty:

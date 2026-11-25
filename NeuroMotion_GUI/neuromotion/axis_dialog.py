@@ -43,17 +43,17 @@ class AxisSettingsDialog(tk.Toplevel):
             ttk.Label(x, text=label).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Entry(x, textvariable=variable, width=19).grid(row=row, column=1, sticky="w")
         ttk.Label(x, text="跨度 1 ms–60 s；手动范围限制在本次冻结缓存内。", foreground="#64748b").grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(frame, text="联动 CH1 / CH2 纵轴（解除后恢复各自设置）", variable=self.linked, command=self._toggle_link).pack(anchor="w", pady=10)
+        ttk.Checkbutton(frame, text="联动全部 EMG 纵轴（解除后恢复各自设置）", variable=self.linked, command=self._toggle_link).pack(anchor="w", pady=10)
         self.y_notebook = ttk.Notebook(frame)
         self.y_notebook.pack(fill="x", pady=3)
         self.y_editors = []
-        for channel in range(2):
+        for channel in range(len(self.draft.channels)):
             settings = self.draft.channels[channel]
             limits = page.last_y_ranges[channel] if settings.automatic and not self.draft.linked else (settings.minimum_uv, settings.maximum_uv)
             editor = self._y_editor(self.y_notebook, f"CH{channel + 1} 纵轴", settings, limits)
             self.y_editors.append(editor)
             self.y_notebook.add(editor["frame"], text=f"CH{channel + 1}")
-        self.common_editor = self._y_editor(self.y_notebook, "联动纵轴 · 两路共同量程", self.draft.common_y,
+        self.common_editor = self._y_editor(self.y_notebook, "联动纵轴 · 全部通道共同量程", self.draft.common_y,
                                             page.last_y_ranges[0] if self.draft.linked else (-1, 1))
         self.y_notebook.add(self.common_editor["frame"], text="联动量程")
         self._enable_editors()
@@ -141,7 +141,7 @@ class AxisSettingsDialog(tk.Toplevel):
         self._enable_editors()
 
     def _enable_editors(self):
-        self.y_notebook.select(2 if self.linked.get() else 0)
+        self.y_notebook.select(len(self.y_editors) if self.linked.get() else 0)
         for editor, enabled in [(editor, not self.linked.get()) for editor in self.y_editors] + [(self.common_editor, self.linked.get())]:
             for widget in editor["frame"].winfo_children():
                 if isinstance(widget, ttk.Combobox):

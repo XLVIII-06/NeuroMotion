@@ -12,8 +12,20 @@ startup_error.log
 Docs/*PLAN*.md
 Docs/*REPORT*.md
 Docs/EXECUTION_STATUS.json
+Docs/FOUR_CHANNEL_EXECUTION_STATUS.json
+Docs/AMPLITUDE_BL422_EXECUTION_STATUS.json
 Docs/DIRECTORY_STRUCTURE.md
 Docs/Electronic hardware/
+
+# Bench test guides and figures, plus local wiring export previews.
+Docs/AMPLITUDE_1MV_STEPS.md
+Docs/AMPLITUDE_1MV_BREADBOARD.*
+Docs/TTL_TEST_GUIDE.md
+Docs/TTL_BREADBOARD.*
+Docs/NEUROMOTION_ADS_PIN_LAYOUT.*
+Docs/NeuroMotion_ADS_Breadboard.*
+Docs/preview.png
+Docs/render.html
 
 # Windows builds are delivered locally, not committed as large Git blobs.
 NeuroMotion_GUI/build/

@@ -35,6 +35,14 @@ def main():
     built = build / "dist/NeuroMotion.exe"
     if not built.is_file():
         raise FileNotFoundError(built)
+    smoke_reports = []
+    if not args.skip_smoke_test:
+        for channels in (2,4):
+            smoke = root / "output" / f"package_smoke_{channels}ch_{stamp}"
+            result = subprocess.run([str(built), "--smoke-test", str(smoke), "--channels", str(channels)], cwd=build, env=env, timeout=120)
+            if result.returncode:
+                raise RuntimeError(f"Packaged {channels}-channel smoke test failed: {smoke}; previous EXE retained")
+            smoke_reports.append(str(smoke))
     target = root / "NeuroMotion.exe"
     temporary = root / "NeuroMotion.exe.new"
     shutil.copy2(built, temporary)
@@ -42,15 +50,9 @@ def main():
         temporary.replace(target)
     except PermissionError as exc:
         raise RuntimeError("Close the running NeuroMotion.exe, then rerun this build") from exc
-    smoke = None
-    if not args.skip_smoke_test:
-        smoke = root / "output" / f"package_smoke_{stamp}"
-        result = subprocess.run([str(target), "--smoke-test", str(smoke)], cwd=build, env=env, timeout=120)
-        if result.returncode:
-            raise RuntimeError(f"Packaged smoke test failed: {smoke}")
     packages = {name: version(name) for name in ("pyinstaller", "numpy", "pandas", "opencv-python", "scipy", "matplotlib", "pyserial")}
     write_json(build / "last_build.json", {"executable": file_info(target), "log": str(log), "packages": packages,
-               "built_at": datetime.now().astimezone().isoformat(), "smoke_report": str(smoke) if smoke else None})
+               "built_at": datetime.now().astimezone().isoformat(), "smoke_reports": smoke_reports})
     print(f"Built and checked: {target}", flush=True)
     return 0
 
